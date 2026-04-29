@@ -208,5 +208,5 @@ __marimo__/
 
 # Project Specific
 .env
-data/
+/data/
 *.log
