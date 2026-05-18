@@ -2,7 +2,7 @@ import os
 import time
 import logging
 import requests
-import xml.etree.ElementTree as ET
+import pandas as pd
 from dotenv import load_dotenv
 
 # 로거 설정
@@ -11,92 +11,63 @@ logger = logging.getLogger(__name__)
 
 class AddressRestorer:
     """
-    마스킹된 지번을 복원하고, 건축물대장 API를 통해 데이터를 보강하는 모듈
-    우선순위:
-    1. 카카오 API를 활용한 지번 복원 시도
-    2. 복원 성공 시 -> 건축물대장 '단건 조회' (트래픽 최소화)
-    3. 복원 실패 시 -> 건축물대장 '동 단위 전체 스캔' 및 교차 검증 (면적 등 비교)
+    avm_precision_set.csv의 미마스킹 지번 데이터를 기반으로
+    정확한 주소 정보를 획득하고 건축물대장 API를 통해 다음을 보강하는 모듈:
+    1. 준공년도 (buildYear)
+    2. 대지면적 (plottageAr)
+    3. 총 주차대수 (parkingCount)
+    4. 공용면적 (pubuseAr)
     """
     def __init__(self):
         load_dotenv()
         self.kakao_api_key = os.getenv("KAKAO_REST_API_KEY")
         self.molit_api_key = os.getenv("MOLIT_API_KEY")
         
-        # 국토교통부_건축HUB_건축물대장정보 서비스 (표제부) 오픈 API
-        self.br_base_url = "https://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo"
+        # 국토교통부_건축HUB_건축물대장정보 서비스 오픈 API 엔드포인트
+        self.br_title_url = "https://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo"
+        self.br_pubuse_url = "https://apis.data.go.kr/1613000/BldRgstHubService/getBrExposPubuseAreaInfo"
 
-    def restore_via_kakao(self, sgg_nm, umd_nm, jibun):
+    def get_address_info_via_kakao(self, sgg_nm, umd_nm, jibun):
         """
-        카카오 로컬 API를 활용하여 마스킹된 지번 복원 및 법정동 코드(umd_cd)를 추출합니다.
-        반환값: (복원된_지번, 법정동_코드_5자리)
+        카카오 주소 검색 API를 호출하여 법정동 코드, 위경도 좌표, 도로명 주소를 정확히 가져옵니다.
         """
         if not self.kakao_api_key:
             logger.error("KAKAO_REST_API_KEY가 설정되지 않았습니다.")
-            return None, None
+            return None
             
-        # 검색어 구성 (예: 종로구 인의동 1**)
-        query = f"{sgg_nm} {umd_nm} {jibun}".replace('**', '').strip()
-        url = "https://dapi.kakao.com/v2/local/search/keyword.json"
+        query = f"{sgg_nm} {umd_nm} {jibun}".strip()
+        url = "https://dapi.kakao.com/v2/local/search/address.json"
         headers = {"Authorization": f"KakaoAK {self.kakao_api_key}"}
-        
-        umd_cd = None
-        restored_jibun = None
         
         try:
             res = requests.get(url, headers=headers, params={"query": query}, timeout=5)
-            docs = []
             if res.status_code == 200:
                 docs = res.json().get('documents', [])
-                
-                if not docs:
-                    fallback_query = f"{sgg_nm} {umd_nm}"
-                    res_fallback = requests.get(url, headers=headers, params={"query": fallback_query}, timeout=5)
-                    if res_fallback.status_code == 200:
-                        docs = res_fallback.json().get('documents', [])
-                        
-                if len(docs) > 0:
-                    first_doc = docs[0]
+                if docs:
+                    addr_info = docs[0].get('address', {})
+                    b_code = addr_info.get('b_code', '')
                     
-                    # 위경도 좌표 추출 (키워드 검색은 최상위에 x, y 존재)
-                    lat = first_doc.get('y')
-                    lng = first_doc.get('x')
-                    road_address = first_doc.get('road_address_name')
+                    # 10자리 법정동 코드에서 앞 5자리는 sigunguCd, 뒤 5자리는 bjdongCd
+                    umd_cd = b_code[5:] if len(b_code) == 10 else None
+                    lat = docs[0].get('y')
+                    lng = docs[0].get('x')
                     
-                    # 법정동 코드 추출 (키워드 검색 결과에서 주소 정보 파싱)
-                    # 키워드 검색 결과에는 b_code가 바로 없을 수 있으므로 address_name을 사용해 재조회하거나 유추
-                    address_name = first_doc.get('address_name', '')
+                    road_addr_info = docs[0].get('road_address')
+                    road_address = road_addr_info.get('address_name') if road_addr_info else None
                     
-                    # 1. 법정동 코드 확보를 위해 주소 정보가 있는 경우 활용
-                    if address_name:
-                        # 주소 검색 API로 법정동 코드를 가져오기 위한 재시도 (캐시 효과)
-                        addr_url = "https://dapi.kakao.com/v2/local/search/address.json"
-                        res_addr = requests.get(addr_url, headers=headers, params={"query": address_name}, timeout=5)
-                        if res_addr.status_code == 200:
-                            addr_docs = res_addr.json().get('documents', [])
-                            if addr_docs:
-                                addr_info = addr_docs[0].get('address', {})
-                                b_code = addr_info.get('b_code', '')
-                                umd_cd = b_code[5:] if len(b_code) == 10 else None
-                                
-                                # 지번 복원 시도
-                                if len(addr_docs) == 1:
-                                    main_no = addr_info.get('main_address_no', '')
-                                    sub_no = addr_info.get('sub_address_no', '')
-                                    if main_no:
-                                        restored_jibun = f"{main_no}-{sub_no}" if sub_no else main_no
-
-                    return restored_jibun, umd_cd, lat, lng, road_address
+                    return {
+                        "umd_cd": umd_cd,
+                        "lat": lat,
+                        "lng": lng,
+                        "road_address": road_address
+                    }
         except Exception as e:
             logger.error(f"카카오 API 호출 오류: {e}")
-            
-        if jibun and '*' not in str(jibun):
-            restored_jibun = jibun
-            
-        return restored_jibun, umd_cd, None, None, None
+        return None
 
     def _split_jibun_for_api(self, jibun):
         """지번 텍스트(예: 123-4)를 본번 4자리, 부번 4자리 포맷으로 변환합니다."""
-        if not jibun or '*' in str(jibun) or str(jibun).strip() == "":
+        if not jibun or str(jibun).strip() == "":
             return "", ""
         parts = str(jibun).split('-')
         try:
@@ -106,10 +77,28 @@ class AddressRestorer:
         except:
             return "", ""
 
-    def fetch_br_exact(self, sgg_cd, umd_cd, jibun):
-        """1단계: 정확한 지번으로 건축물대장 단건 조회를 수행합니다."""
+    def _fetch_br_json(self, url, params):
+        """오픈 API 호출 결과를 JSON 형식으로 파싱하여 반환합니다."""
+        params['_type'] = 'json'
+        try:
+            res = requests.get(url, params=params, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                items = data.get('response', {}).get('body', {}).get('items', {})
+                if isinstance(items, dict):
+                    item_list = items.get('item', [])
+                    if isinstance(item_list, dict):
+                        return [item_list]
+                    return item_list
+        except Exception as e:
+            logger.error(f"오픈 API 호출 오류: {e}")
+        return []
+
+    def fetch_br_title(self, sgg_cd, umd_cd, jibun):
+        """표제부 API(/getBrTitleInfo)를 사용하여 건물 기본 및 대지면적, 주차대수 정보를 획득합니다."""
         bun, ji = self._split_jibun_for_api(jibun)
-        if not bun: return None
+        if not bun: 
+            return None
         
         params = {
             "serviceKey": requests.utils.unquote(self.molit_api_key),
@@ -121,131 +110,141 @@ class AddressRestorer:
             "pageNo": "1"
         }
         
-        try:
-            res = requests.get(self.br_base_url, params=params, timeout=10)
-            if res.status_code == 200:
-                items = self._parse_br_xml(res.text)
-                if items:
-                    return items[0]
-        except Exception as e:
-            logger.error(f"단건 조회 오류: {e}")
+        items = self._fetch_br_json(self.br_title_url, params)
+        if items:
+            return items[0]
         return None
 
-    def fetch_br_dong_scan(self, sgg_cd, umd_cd, target_ar, target_year):
-        """2단계: 지번 복원 실패 시 동 단위 스캔을 통한 교차 검증을 수행합니다."""
-        logger.info(f"2단계 동 단위 스캔 시작 (지역코드: {sgg_cd}{umd_cd})")
+    def fetch_br_pubuse(self, sgg_cd, umd_cd, jibun, floor_val, building_ar):
+        """
+        전유공용면적 API(/getBrExposPubuseAreaInfo)를 활용하여
+        해당 층(floor)과 전용면적(buildingAr)에 대응되는 호실의 공용면적 합계를 계산합니다.
+        """
+        bun, ji = self._split_jibun_for_api(jibun)
+        if not bun: 
+            return 0.0
+            
+        params = {
+            "serviceKey": requests.utils.unquote(self.molit_api_key),
+            "sigunguCd": sgg_cd,
+            "bjdongCd": umd_cd,
+            "bun": bun,
+            "ji": ji,
+            "numOfRows": "100",  # 한 층당 호실이 많을 수 있으므로 넉넉하게 조회
+            "pageNo": "1"
+        }
         
-        page_no = 1
-        max_pages = 20
+        items = self._fetch_br_json(self.br_pubuse_url, params)
+        if not items:
+            return 0.0
+            
+        try:
+            # floor_val 파싱 (예: '5.0' -> 5, 5 -> 5)
+            target_floor = str(int(float(floor_val))) if floor_val and not pd.isna(floor_val) else None
+        except:
+            target_floor = str(floor_val).replace('.0', '').strip() if floor_val else None
+
+        target_pk = None
         
-        while page_no <= max_pages:
-            params = {
-                "serviceKey": requests.utils.unquote(self.molit_api_key),
-                "sigunguCd": sgg_cd,
-                "bjdongCd": umd_cd,
-                "numOfRows": "100",
-                "pageNo": str(page_no)
-            }
+        # 1단계: 층과 전용면적이 일치하는 호실의 mgmBldrgstPk(건축물대장 고유키) 탐색
+        for item in items:
+            # exposPubuseGbCd == '1' (전유)
+            is_priv = str(item.get('exposPubuseGbCd')) == '1'
+            item_floor = str(item.get('flrNo')).strip()
             
             try:
-                res = requests.get(self.br_base_url, params=params, timeout=10)
-                items = self._parse_br_xml(res.text)
-                if not items: break
-                    
-                for item in items:
-                    # [개선] 안전한 숫자 변환
-                    try:
-                        br_ar = float(item.get('totArea') or 0)
-                        tr_ar = float(target_ar or 0)
-                        
-                        br_use_date = str(item.get('useAprvDe') or "").strip()
-                        br_year = int(br_use_date[:4]) if len(br_use_date) >= 4 and br_use_date[:4].isdigit() else 0
-                        
-                        tr_year_str = str(target_year or "0").strip()
-                        tr_year = int(tr_year_str) if tr_year_str.isdigit() else 0
-                        
-                        area_match = (tr_ar > 0 and abs(br_ar - tr_ar) < 1.0)
-                        year_match = (tr_year > 0 and br_year > 0 and abs(br_year - tr_year) <= 1)
-                        
-                        if area_match and year_match:
-                            return item
-                    except (ValueError, TypeError):
-                        continue
-                        
-                page_no += 1
-                time.sleep(0.2)
+                item_area = float(item.get('area') or 0)
+                target_area = float(building_ar)
+                area_match = abs(item_area - target_area) < 0.5  # 오차 범위 0.5m2 이내 매칭
+            except:
+                area_match = False
                 
-            except Exception as e:
-                logger.error(f"동 단위 스캔 오류: {e}")
+            if is_priv and item_floor == target_floor and area_match:
+                target_pk = item.get('mgmBldrgstPk')
                 break
-        return None
-
-    def _parse_br_xml(self, xml_text):
-        """XML 파싱 유틸리티"""
-        try:
-            root = ET.fromstring(xml_text)
-            items = []
-            for item in root.findall(".//item"):
-                items.append({child.tag: child.text for child in item})
-            return items
-        except:
-            return []
+                
+        # 2단계: 동일한 고유키(mgmBldrgstPk)를 갖는 호실의 공용(exposPubuseGbCd == '2') 면적 합산
+        if target_pk:
+            pubuse_sum = 0.0
+            for item in items:
+                is_pub = str(item.get('exposPubuseGbCd')) == '2'
+                is_same_pk = item.get('mgmBldrgstPk') == target_pk
+                if is_pub and is_same_pk:
+                    try:
+                        pubuse_sum += float(item.get('area') or 0)
+                    except:
+                        continue
+            return round(pubuse_sum, 2)
+            
+        return 0.0
 
     def restore_and_enrich(self, item_data):
-        """메인 파이프라인: 주어진 실거래가 데이터의 위치를 추적하고 보강합니다."""
+        """
+        메인 파이프라인:
+        지번 조건에 근거하여 안전하고 정확하게 건축물대장의 핵심 지표를 매핑 보강합니다.
+        """
         sgg_cd = item_data.get('sggCd')
         sgg_nm = item_data.get('sggNm')
         umd_nm = item_data.get('umdNm')
         jibun = item_data.get('jibun')
         
-        # 1. 카카오 API로 주소 정보 추출
-        restored_jibun, umd_cd, lat, lng, road_address = self.restore_via_kakao(sgg_nm, umd_nm, jibun)
-        
-        # 결과값 업데이트 (기본 정보)
-        item_data['lat'] = lat
-        item_data['lng'] = lng
-        item_data['road_address'] = road_address
+        if not sgg_nm or not umd_nm or not jibun:
+            return item_data
+            
+        # 1. 카카오 API로 법정동 코드 및 주소 위치 정보 획득
+        addr_info = self.get_address_info_via_kakao(sgg_nm, umd_nm, jibun)
+        if not addr_info:
+            return item_data
+            
+        umd_cd = addr_info.get('umd_cd')
+        item_data['lat'] = addr_info.get('lat')
+        item_data['lng'] = addr_info.get('lng')
+        item_data['road_address'] = addr_info.get('road_address')
         
         if not umd_cd:
             return item_data
             
-        # 2. 우선순위 1: 단건 조회
-        br_data = None
-        if restored_jibun and '*' not in restored_jibun:
-            br_data = self.fetch_br_exact(sgg_cd, umd_cd, restored_jibun)
+        # 2. 표제부 API 호출 -> 준공년도, 대지면적, 주차대수 수집
+        br_title = self.fetch_br_title(sgg_cd, umd_cd, jibun)
+        if br_title:
+            item_data['buildingName'] = br_title.get('bldNm')
+            item_data['mainPurpsCdNm'] = br_title.get('mainPurpsCdNm')
+            
+            # 건축 준공년도(buildYear) 보강
+            use_apr_day = br_title.get('useAprDay')
+            if use_apr_day and str(use_apr_day).strip() and len(str(use_apr_day)) >= 4:
+                item_data['buildYear'] = str(use_apr_day)[:4]
                 
-        # 3. 우선순위 2: 동 단위 스캔
-        if not br_data:
-            target_ar = item_data.get('buildingAr')
-            target_year = item_data.get('buildYear')
-            br_data = self.fetch_br_dong_scan(sgg_cd, umd_cd, target_ar, target_year)
+            # 대지면적(plottageAr) 보강
+            plat_area = br_title.get('platArea')
+            if plat_area:
+                try:
+                    item_data['plottageAr'] = round(float(plat_area), 2)
+                except:
+                    pass
+                    
+            # 총 주차대수(parkingCount) 보강 (옥내/외 자주식/기계식 합계)
+            try:
+                indr_auto = int(br_title.get('indrAutoUtcnt') or 0)
+                indr_mech = int(br_title.get('indrMechUtcnt') or 0)
+                oudr_auto = int(br_title.get('oudrAutoUtcnt') or 0)
+                oudr_mech = int(br_title.get('oudrMechUtcnt') or 0)
+                item_data['parkingCount'] = indr_auto + indr_mech + oudr_auto + oudr_mech
+            except:
+                item_data['parkingCount'] = 0
+        else:
+            item_data['parkingCount'] = 0
+
+        # 3. 전유공용면적 API 호출 -> 공용면적(pubuseAr) 수집
+        # 집합건물인 경우에만 정밀 조회를 시도하고, 일반 건물일 경우 0.0 설정
+        building_type = item_data.get('buildingType')
+        floor_val = item_data.get('floor')
+        building_ar = item_data.get('buildingAr')
         
-        if br_data:
-            item_data['buildingName'] = br_data.get('bldNm')
-            item_data['mainPurpsCdNm'] = br_data.get('mainPurpsCdNm')
-            # 지번 복원 성공 시 업데이트
-            if not restored_jibun or '*' in restored_jibun:
-                rbun = br_data.get('bun', '').lstrip('0')
-                rji = br_data.get('ji', '').lstrip('0')
-                item_data['restored_jibun'] = f"{rbun}-{rji}" if rji != "0" else rbun
-            else:
-                item_data['restored_jibun'] = restored_jibun
+        if building_type == '집합' and floor_val and building_ar:
+            pubuse_ar = self.fetch_br_pubuse(sgg_cd, umd_cd, jibun, floor_val, building_ar)
+            item_data['pubuseAr'] = pubuse_ar
+        else:
+            item_data['pubuseAr'] = 0.0
             
         return item_data
-
-if __name__ == "__main__":
-    # 스모크 테스트용 코드
-    restorer = AddressRestorer()
-    
-    # 예시 1: 마스킹된 거래 데이터
-    test_item = {
-        "sggCd": "11110",
-        "sggNm": "종로구",
-        "umdNm": "인의동",
-        "jibun": "1**",
-        "buildingAr": "17098.51",
-        "buildYear": "1982"
-    }
-    
-    enriched = restorer.restore_and_enrich(test_item)
-    print("최종 보강된 데이터:", enriched)
