@@ -1,6 +1,19 @@
 # SCA AVM Engine: 대한민국 상업용 부동산 자동가치산정모형 고도화 프로젝트
 
+🔗 **모델 배포 주소 (Hugging Face)**: [https://huggingface.co/donggyuuu/SCA-AVM-Engine](https://huggingface.co/donggyuuu/SCA-AVM-Engine)
+
 본 저장소는 실거래 가격 데이터를 기반으로 금융 기관 감정평가 수준의 고정밀 자동가치산정모형(AVM, Automated Valuation Model)을 설계하고 구축한 프로젝트 결과물입니다. 5단계의 아키텍처 고도화를 거쳐 최종 결정계수 0.7054를 정복한 기술적 도약과 모델 튜닝 과정을 다룹니다.
+
+---
+
+## 목차 (Table of Contents)
+- [1. SCA AVM Engine 성능 진화 요약](#1-sca-avm-engine-성능-진화-요약)
+- [2. 각 단계별 아키텍처 설계 및 튜닝 명세](#2-각-단계별-아키텍처-설계-및-튜닝-명세)
+- [3. 손실 함수 설계에 관한 수학적 실증 결과 (MSE vs MAE)](#3-손실-함수-설계에-관한-수학적-실증-결과-mse-vs-mae)
+- [4. 최종 서빙용 모델 및 튜닝 파라미터 정의](#4-최종-서빙용-모델-및-튜닝-파라미터-정의)
+- [5. 모델 내보내기 및 실시간 서빙 연동 규격](#5-모델-내보내기-및-실시간-서빙-연동-규격)
+- [6. 데이터 수집 및 전처리 파이프라인 (Data Pipeline)](#6-데이터-수집-및-전처리-파이프라인-data-pipeline)
+- [최종 상용 배포용 모델 사용법 (Inference Guide)](#최종-상용-배포용-모델-사용법-inference-guide)
 
 ---
 
@@ -125,4 +138,67 @@ model = HistGradientBoostingRegressor(
   $$\text{adjusted\_price\_per\_m2} = \left( \frac{\text{dealAmount} \times 10,000}{\text{buildingAr}} \right) \times \left( \frac{\text{2026년 3월 지점의 지역 지상 지수}}{\text{거래 발생 연월의 지역 지상 지수}} \right)$$
 * 이를 통해 인플레이션 및 거시 경제적 부동산 흐름 노이즈를 완벽하게 차단하고, 모델이 **오직 개별 매물의 입지 가치와 물리적 지표에만 집중하여 예측**하도록 물리적 학습 타겟을 동기화하였습니다.
 
+---
 
+## 최종 상용 배포용 모델 사용법 (Inference Guide)
+
+최종 학습되어 산출된 모델 패키지(`.pkl`)를 서비스 API나 백엔드 서버에 연동하여 신규 매물의 가격을 예측하는 워크플로우입니다. 모델 패키지 내부에는 단순 추론 객체뿐만 아니라, **실시간 텍스트/좌표 맵핑을 위한 사전 메타데이터**가 모두 포함되어 있습니다.
+
+### 1단계: 모델 패키지 로드 (Load Model Package)
+```python
+import pickle
+import numpy as np
+import pandas as pd
+
+# 1. 아티팩트 디렉토리에서 패키지 로드
+with open("data/model/final_avm_model_package.pkl", "rb") as f:
+    package = pickle.load(f)
+    
+model = package['model']
+feature_names = package['feature_names']          # 예측 시 보장되어야 할 피처 순서
+categorical_cols = package['categorical_cols']    # 범주형 컬럼 리스트
+
+# 2. 실시간 변환용 사전(Dictionary) 메타데이터
+umd_map = package['umd_mapping']['umd_to_price_log'] 
+global_median = package['umd_mapping']['global_median_log']
+sgg_hotspots = package['sgg_hotspots']
+```
+
+### 2단계: 신규 데이터 입력 및 파생 변수 계산 (Feature Engineering)
+API를 통해 단일 매물 데이터가 유입되면, 모델이 학습했던 파생 변수 형태와 일치하도록 가공해야 합니다.
+
+1. **비율 지표 산출**: `exclusive_rate`(전용률), `parking_density`(주차밀도), `bcRat`(건폐율), `vlRat`(용적률) 산출
+2. **건물 구조 원핫 인코딩**: 원본 `strctCdNm`(예: '철근콘크리트구조')을 `strct_철근콘크리트` 등 여러 컬럼의 0/1 매핑
+3. **외부 API/캐시 연동 피처**: `dist_to_subway`(지하철 역까지의 거리), `cafe_count_200m`(반경 내 카페 수) 등 외부 인프라 데이터 세팅
+
+### 3단계: 패키지 메타데이터를 활용한 공간 지표 매핑 (Spatial Mapping)
+모델은 한글 주소 문자열을 그대로 학습하지 않으므로, 패키지에 동봉된 사전을 이용해 실시간 숫자로 매핑합니다.
+
+* **법정동 타겟 인코딩 (`umd_encoded_oof`)**
+  입력된 법정동명(`umdNm`)을 `umd_map`에 넣어 평균 로그 단가로 매핑하며, 매핑되지 않는 신규 구역의 경우 `global_median`으로 보완합니다.
+  ```python
+  encoded_val = umd_map.get(input_umdNm, global_median)
+  ```
+* **상권 핫스팟 최단 거리 (`dist_to_closest_hotspot`)**
+  매물의 위경도(`lat`, `lng`)와, 모델에 저장된 해당 시군구(`sggNm`)의 상권 핵심 좌표군(`sgg_hotspots`) 간의 하버사인(Haversine) 최단 거리를 실시간으로 연산하여 추가합니다.
+
+### 4단계: 순서 정렬 및 단가 추론 (Predict & Inverse Log)
+준비된 피처들을 모델이 훈련할 때 사용한 배열과 동일하게 정렬 후 추론합니다.
+
+```python
+# 1. 컬럼 순서 및 타입 맞추기
+inference_df = my_processed_data[feature_names]
+
+for col in categorical_cols:
+    inference_df[col] = inference_df[col].astype('category')
+
+# 2. 단가 예측 수행 (로그화된 ㎡당 단가)
+predicted_log_price = model.predict(inference_df)
+
+# 3. 원래 원화(₩) 단가로 복원 (expm1 적용)
+predicted_price_per_m2 = np.expm1(predicted_log_price)
+
+# 4. 종합 부동산 담보가치 산출
+final_total_price = predicted_price_per_m2[0] * input_buildingAr
+```
+> **Tip:** 단순히 `predict()`만 호출하는 것이 아니라, 사용자가 입력한 주소나 건물 스펙을 모델 패키지 내부의 맵과 결합하여 전처리를 통과시켜주는 **API 래퍼(Wrapper) 로직**이 서비스단에 함께 구성되어야 합니다.

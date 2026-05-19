@@ -1,3 +1,14 @@
+"""
+파일명: run_stacking_ensemble.py
+설명: 스태킹 앙상블(Stacking Ensemble) 모델 학습 및 실행
+단계 및 처리과정:
+1. 베이스 모델 정의: LightGBM, XGBoost, Random Forest 등 다양한 개별 모델을 정의합니다.
+2. 메타 데이터 생성(Level-1): 각 베이스 모델의 예측값(OOF)을 통해 메타 피처를 생성합니다.
+3. 메타 모델 훈련(Level-2): 예측된 메타 피처를 활용하여 최종 결합 메타 모델을 학습시킵니다.
+4. 모델 검증: 앙상블 전후의 성능 평가를 수행하고 과적합 여부를 점검합니다.
+5. 최종 앙상블 모델 출력: 스태킹 파이프라인 전체를 래핑한 최종 예측 모델을 생성합니다.
+"""
+
 import pandas as pd
 import numpy as np
 import os

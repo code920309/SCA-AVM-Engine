@@ -1,3 +1,14 @@
+"""
+파일명: add_multi_centroid_and_oof.py
+설명: 다중 중심점 피처 추가 및 OOF(Out-Of-Fold) 예측 수행
+단계 및 처리과정:
+1. 데이터 로드: 다중 중심점 데이터를 로드합니다.
+2. 중심점 특성 병합: 데이터의 공간 특성에 따른 추가 중심점을 병합합니다.
+3. K-Fold 설정: 교차 검증을 위한 K-Fold를 설정합니다.
+4. OOF(Out-Of-Fold) 수행: OOF 방식으로 예측을 수행하여 메타 피처를 생성합니다.
+5. 결과 저장: 생성된 OOF 피처 및 메타 데이터가 추가된 데이터셋을 저장합니다.
+"""
+
 import pandas as pd
 import numpy as np
 import os
